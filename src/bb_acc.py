@@ -47,6 +47,8 @@ def init_database(user: str):
             total_available_balance DECIMAL(20, 8),
             account_mm_rate DECIMAL(10, 8),
             total_maintenance_margin DECIMAL(20, 8),
+            usdt_equity DECIMAL(20, 8),
+            btc_equity DECIMAL(20, 8),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -82,6 +84,23 @@ def init_database(user: str):
         )
     """)
 
+    # Create open_orders table
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {user}_open_orders (
+            order_id VARCHAR(100) PRIMARY KEY,
+            symbol VARCHAR(50),
+            side VARCHAR(10),
+            qty DECIMAL(20, 8),
+            leaves_qty DECIMAL(20, 8),
+            status VARCHAR(20),
+            price DECIMAL(20, 8),
+            avg_price DECIMAL(20, 8),
+            order_type VARCHAR(20),
+            category VARCHAR(20),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
@@ -109,6 +128,11 @@ def get_wallet_balance(session: HTTP, user: str):
     accountMMRate = float(account_info["accountMMRate"])
     totalMaintenanceMargin = float(account_info["totalMaintenanceMargin"])
 
+    coins_info = {item["coin"]: item for item in account_info.get("coin", [])}
+
+    usdt_equity = float(coins_info.get("USDT", {}).get("equity", "0"))
+    btc_equity = float(coins_info.get("BTC", {}).get("equity", "0"))
+
     wallet_data = {
         "timestamp": ts,
         "totalEquity": totalEquity,
@@ -118,6 +142,8 @@ def get_wallet_balance(session: HTTP, user: str):
         "totalAvailableBalance": totalAvailableBalance,
         "accountMMRate": accountMMRate,
         "totalMaintenanceMargin": totalMaintenanceMargin,
+        "usdtEquity": usdt_equity,
+        "btcEquity": btc_equity,
     }
 
     # Save to database
@@ -128,8 +154,8 @@ def get_wallet_balance(session: HTTP, user: str):
         INSERT INTO {user}_wallet_balance (timestamp, total_equity, account_im_rate, 
                                   total_margin_balance, total_initial_margin, 
                                   total_available_balance, account_mm_rate, 
-                                  total_maintenance_margin)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                  total_maintenance_margin, usdt_equity, btc_equity)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """,
         (
             ts,
@@ -140,6 +166,8 @@ def get_wallet_balance(session: HTTP, user: str):
             totalAvailableBalance,
             accountMMRate,
             totalMaintenanceMargin,
+            usdt_equity,
+            btc_equity,
         ),
     )
     conn.commit()
@@ -197,6 +225,105 @@ def get_coin_greeks(session: HTTP, user: str, base_coin: str | None = None):
 
     logging.info(f"Retrieved and saved {len(greeks_data)} coin greeks records")
     return greeks_data
+
+
+def get_open_orders(session: HTTP, user: str, category: str):
+    """
+    Get all open orders information.
+
+    Args:
+        session: HTTP session object
+        user: User identifier for table prefix
+        category: Product type (linear, inverse, option)
+    """
+    limit = 50
+
+    res = session.get_open_orders(category=category, limit=limit)
+
+    if res["retCode"] != 0:
+        logging.error(f"Failed to get open orders: {res['retMsg']}")
+        return []
+
+    orders = res["result"].get("list", [])
+
+    orders_info = [
+        {
+            "order_id": order["orderId"],
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "qty": order["qty"],
+            "leaves_qty": order["leavesQty"],
+            "status": order["orderStatus"],
+            "price": order["price"],
+            "avg_price": order["avgPrice"],
+            "order_type": order["orderType"],
+            "category": category,
+        }
+        for order in orders
+    ]
+
+    # Save to database
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if orders_info:
+        # Get current order IDs from API
+        current_order_ids = [order["order_id"] for order in orders_info]
+
+        # Insert/update open orders
+        for order in orders_info:
+            cur.execute(
+                f"""
+                INSERT INTO {user}_open_orders (order_id, symbol, side, qty, leaves_qty, 
+                                       status, price, avg_price, order_type, category)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (order_id) DO UPDATE SET
+                    symbol = EXCLUDED.symbol,
+                    side = EXCLUDED.side,
+                    qty = EXCLUDED.qty,
+                    leaves_qty = EXCLUDED.leaves_qty,
+                    status = EXCLUDED.status,
+                    price = EXCLUDED.price,
+                    avg_price = EXCLUDED.avg_price,
+                    order_type = EXCLUDED.order_type,
+                    category = EXCLUDED.category,
+                    updated_at = CURRENT_TIMESTAMP
+            """,
+                (
+                    order["order_id"],
+                    order["symbol"],
+                    order["side"],
+                    order["qty"],
+                    order["leaves_qty"],
+                    order["status"],
+                    order["price"],
+                    order["avg_price"],
+                    order["order_type"],
+                    order["category"],
+                ),
+            )
+
+        # Delete orders that are no longer open (closed orders)
+        placeholders = ",".join(["%s"] * len(current_order_ids))
+        cur.execute(
+            f"""
+            DELETE FROM {user}_open_orders 
+            WHERE category = %s AND order_id NOT IN ({placeholders})
+        """,
+            [category] + current_order_ids,
+        )
+    else:
+        # If no open orders, delete all records for this category
+        cur.execute(f"DELETE FROM {user}_open_orders WHERE category = %s", (category,))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    logging.info(
+        f"Retrieved and saved {len(orders_info)} open orders for category: {category}"
+    )
+    return orders_info
 
 
 def get_pos_info(
@@ -336,6 +463,9 @@ def scheduled_data_collection(user: str, api_key: str, api_secret: str):
 
         # Collect positions for different categories
         get_pos_info(session, user, category="option")
+
+        # Collect open orders for different categories
+        get_open_orders(session, user, category="option")
 
         logging.info("Scheduled data collection completed successfully")
 
