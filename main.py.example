@@ -1,0 +1,8 @@
+import os
+from src.bb_acc import run_scheduler
+
+api_key = os.getenv('API_BB_OPTION')
+api_secret = os.getenv('API_BB_OPTION_KEY')
+
+if __name__ == "__main__":
+    run_scheduler("user_option", api_key, api_secret)
