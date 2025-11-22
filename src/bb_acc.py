@@ -2,7 +2,8 @@ from pybit.unified_trading import HTTP
 import os
 from dotenv import load_dotenv
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from datetime import timedelta
+from typing import Literal
 from apscheduler.schedulers.blocking import BlockingScheduler
 import logging
 from datetime import datetime
@@ -101,6 +102,52 @@ def init_database(user: str):
         )
     """)
 
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {user}_income (
+            id SERIAL PRIMARY KEY,
+            timestamp BIGINT NOT NULL,
+            symbol VARCHAR(50),
+            currency VARCHAR(10),
+            incomeType VARCHAR(20) NOT NULL CHECK (incomeType IN ('COMMISSION', 'FUNDING')),
+            income DECIMAL(20, 8) NOT NULL
+        )
+    """)
+
+    # Create trades table
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {user}_trades (
+            id SERIAL PRIMARY KEY,
+            timestamp BIGINT NOT NULL,
+            symbol VARCHAR(50),
+            side VARCHAR(10),
+            type VARCHAR(20),
+            order_id VARCHAR(100),
+            exec_price DECIMAL(20, 8),
+            order_price DECIMAL(20, 8),
+            exec_qty DECIMAL(20, 8),
+            fee DECIMAL(20, 8),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(order_id, timestamp)
+        )
+    """)
+
+    # Create deliveries table
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {user}_deliveries (
+            id SERIAL PRIMARY KEY,
+            timestamp BIGINT NOT NULL,
+            symbol VARCHAR(50),
+            side VARCHAR(10),
+            position DECIMAL(20, 8),
+            entry_price DECIMAL(20, 8),
+            delivery_price DECIMAL(20, 8),
+            strike DECIMAL(20, 8),
+            fee DECIMAL(20, 8),
+            delivery_rpl DECIMAL(20, 8),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timestamp)
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -111,7 +158,7 @@ def get_wallet_balance(session: HTTP, user: str):
     """
     Get wallet balance information.
     """
-    res = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+    res = session.get_wallet_balance(accountType="UNIFIED")
 
     if res["retCode"] != 0:
         logging.error(f"Failed to get wallet balance: {res['retMsg']}")
@@ -444,15 +491,9 @@ def get_pos_info(
     return {"positions": all_positions, "total_count": len(all_positions)}
 
 
-def scheduled_data_collection(user: str, api_key: str, api_secret: str):
+def scheduled_data_collection(user: str, session: HTTP):
     """Scheduled task to collect wallet balance and coin greeks data"""
     try:
-        session = HTTP(
-            testnet=False,
-            api_key=api_key,
-            api_secret=api_secret,
-        )
-
         logging.info("Starting scheduled data collection...")
 
         # Collect wallet balance
@@ -473,20 +514,430 @@ def scheduled_data_collection(user: str, api_key: str, api_secret: str):
         logging.error(f"Error in scheduled data collection: {e}")
 
 
+def get_delivery_history(
+    session: HTTP,
+    category: str = "option",
+    startTime: int | None = None,
+    endTime: int | None = None,
+):
+    cursor = ""
+    data = []
+    while True:
+        res = session.get_option_delivery_record(
+            category=category,
+            startTime=startTime,
+            endTime=endTime,
+            cursor=cursor,
+        )
+        lst = res["result"]["list"]
+
+        if not lst:
+            break
+
+        if len(lst) < 50:
+            data.extend(lst)
+            break
+
+        data.extend(lst)
+        cursor = res["result"]["nextPageCursor"]
+
+    data = [
+        {
+            "timestamp": int(item["deliveryTime"]),
+            "symbol": item["symbol"],
+            "side": item["side"],
+            "position": float(item["position"]) if item["position"] else 0.0,
+            "entryPrice": float(item["entryPrice"]) if item["entryPrice"] else 0.0,
+            "deliveryPrice": float(item["deliveryPrice"])
+            if item["deliveryPrice"]
+            else 0.0,
+            "strike": float(item["strike"]) if item["strike"] else 0.0,
+            "fee": float(item["fee"]) if item["fee"] else 0.0,
+            "deliveryRpl": float(item["deliveryRpl"]) if item["deliveryRpl"] else 0.0,
+        }
+        for item in data
+    ]
+
+    return data
+
+
+def get_trade_history(
+    session: HTTP,
+    category: str = "option",
+    startTime: int | None = None,
+    endTime: int | None = None,
+):
+    cursor = ""
+    data = []
+    while True:
+        res = session.get_executions(
+            category=category,
+            startTime=startTime,
+            endTime=endTime,
+            cursor=cursor,
+        )
+        lst = res["result"]["list"]
+
+        if not lst:
+            break
+
+        if len(lst) < 50:
+            data.extend(lst)
+            break
+
+        data.extend(lst)
+        cursor = res["result"]["nextPageCursor"]
+
+    data = [
+        {
+            "timestamp": int(item["execTime"]),
+            "symbol": item["symbol"],
+            "side": item["side"],
+            "type": item["orderType"],
+            "orderId": item["orderId"],
+            "execPrice": float(item["execPrice"]) if item["execPrice"] else 0.0,
+            "orderPrice": float(item["orderPrice"]) if item["orderPrice"] else 0.0,
+            "execQty": float(item["execQty"]) if item["execQty"] else 0.0,
+            "fee": float(item["fee"]) if item["fee"] else 0.0,
+        }
+        for item in data
+    ]
+
+    return data
+
+
+def get_v5_account_transaction_log(
+    session: HTTP,
+    transaction_type: Literal["SETTLEMENT", "TRADE"],
+    startTime: int | None = None,
+    endTime: int | None = None,
+    category: str = "option",
+):
+    cursor = ""
+    data = []
+    while True:
+        res = session.get_transaction_log(
+            category=category,
+            type=transaction_type,
+            startTime=startTime,
+            endTime=endTime,
+            cursor=cursor,
+        )
+        lst = res["result"]["list"]
+
+        if not lst:
+            break
+
+        if len(lst) < 50:
+            data.extend(lst)
+            break
+
+        data.extend(lst)
+        cursor = res["result"]["nextPageCursor"]
+
+    if transaction_type == "SETTLEMENT":
+        data = [
+            {
+                "timestamp": int(item["transactionTime"]),
+                "symbol": item["symbol"],
+                "currency": item["currency"],
+                "incomeType": "FUNDING",
+                "income": float(item["funding"]) if item["funding"] else 0.0,
+            }
+            for item in data
+        ]
+    elif transaction_type == "TRADE":
+        data = [
+            {
+                "timestamp": int(item["transactionTime"]),
+                "symbol": item["symbol"],
+                "currency": item["currency"],
+                "incomeType": "COMMISSION",
+                "income": -float(item["fee"]) if item["fee"] else 0.0,
+            }
+            for item in data
+        ]
+
+    data = sorted(data, key=lambda x: x["timestamp"])
+    return data
+
+
+def fetch_transactions(
+    session: HTTP,
+    transaction_type: Literal["SETTLEMENT", "TRADE"],
+    startTime: int | datetime = None,
+):
+    if isinstance(startTime, datetime):
+        startTime = int(startTime.timestamp() * 1000)
+
+    endTime = int(datetime.now().timestamp() * 1000)
+
+    # endtime - starttime >= 7 days in milliseconds
+    if endTime - startTime >= 7 * 24 * 60 * 60 * 1000:
+        startTime = endTime - 7 * 24 * 60 * 60 * 1000
+
+    data = []
+    while True:
+        res = get_v5_account_transaction_log(
+            session,
+            transaction_type=transaction_type,
+            startTime=startTime,
+            endTime=endTime,
+        )
+        if not res:
+            break
+
+        startTime = res[-1]["timestamp"] + 1  # Update startTime for next iteration
+        data.extend(res)
+
+    return sorted(data, key=lambda x: x["timestamp"])
+
+
+def fetch_trades(
+    session: HTTP,
+    startTime: int | datetime = None,
+):
+    if isinstance(startTime, datetime):
+        startTime = int(startTime.timestamp() * 1000)
+
+    endTime = int(datetime.now().timestamp() * 1000)
+
+    # endtime - starttime >= 7 days in milliseconds
+    if endTime - startTime >= 7 * 24 * 60 * 60 * 1000:
+        startTime = endTime - 7 * 24 * 60 * 60 * 1000
+
+    data = []
+    while True:
+        res = get_trade_history(
+            session,
+            startTime=startTime,
+            endTime=endTime,
+        )
+        if not res:
+            break
+
+        startTime = res[-1]["timestamp"] + 1  # Update startTime for next iteration
+        data.extend(res)
+
+    return sorted(data, key=lambda x: x["timestamp"])
+
+def fetch_deliveries(
+    session: HTTP,
+    startTime: int | datetime = None,
+):
+    if isinstance(startTime, datetime):
+        startTime = int(startTime.timestamp() * 1000)
+
+    endTime = int(datetime.now().timestamp() * 1000)
+
+    # endtime - starttime >= 30 days in milliseconds
+    if endTime - startTime >= 30 * 24 * 60 * 60 * 1000:
+        startTime = endTime - 30 * 24 * 60 * 60 * 1000
+
+    data = []
+    while True:
+        res = get_delivery_history(
+            session,
+            startTime=startTime,
+            endTime=endTime,
+        )
+        if not res:
+            break
+
+        startTime = res[-1]["timestamp"] + 1  # Update startTime for next iteration
+        data.extend(res)
+
+    return sorted(data, key=lambda x: x["timestamp"])
+
+
+def update_income(session: HTTP, user: str):
+    """
+    Update income data for Bybit exchange.
+
+    :param bybit: Bybit exchange instance
+    :param user: User identifier for database table prefix
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Check if table has data
+    cur.execute(f"SELECT MAX(timestamp) FROM {user}_income WHERE timestamp IS NOT NULL")
+    result = cur.fetchone()
+    start_time = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+
+    if result[0] is not None:
+        start_time = result[0] + 1
+
+    bb_commission = fetch_transactions(
+        session, transaction_type="TRADE", startTime=start_time
+    )
+
+    all_data = bb_commission
+    all_data = sorted(all_data, key=lambda x: x["timestamp"])
+
+    for data in all_data:
+        cur.execute(
+            f"""
+            INSERT INTO {user}_income (timestamp, symbol, currency, incomeType, income)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                data["timestamp"],
+                data["symbol"],
+                data["currency"],
+                data["incomeType"],
+                data["income"],
+            ),
+        )
+
+    logging.info(f"Updated income data for {user} inserted {len(all_data)} records.")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def update_trades(session: HTTP, user: str):
+    """
+    Update trades data for Bybit exchange.
+
+    :param session: HTTP session object
+    :param user: User identifier for database table prefix
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Check if table has data
+    cur.execute(f"SELECT MAX(timestamp) FROM {user}_trades WHERE timestamp IS NOT NULL")
+    result = cur.fetchone()
+    start_time = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+
+    if result[0] is not None:
+        start_time = result[0] + 1
+
+    trades_data = fetch_trades(session, startTime=start_time)
+
+    for trade in trades_data:
+        cur.execute(
+            f"""
+            INSERT INTO {user}_trades (timestamp, symbol, side, type, order_id, 
+                                      exec_price, order_price, exec_qty, fee)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (order_id, timestamp) DO NOTHING
+            """,
+            (
+                trade["timestamp"],
+                trade["symbol"],
+                trade["side"],
+                trade["type"],
+                trade["orderId"],
+                trade["execPrice"],
+                trade["orderPrice"],
+                trade["execQty"],
+                trade["fee"],
+            ),
+        )
+
+    logging.info(
+        f"Updated trades data for {user}, inserted {len(trades_data)} records."
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def update_deliveries(session: HTTP, user: str):
+    """
+    Update deliveries data for Bybit exchange.
+
+    :param session: HTTP session object
+    :param user: User identifier for database table prefix
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Check if table has data
+    cur.execute(
+        f"SELECT MAX(timestamp) FROM {user}_deliveries WHERE timestamp IS NOT NULL"
+    )
+    result = cur.fetchone()
+    start_time = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+
+    if result[0] is not None:
+        start_time = result[0] + 1
+
+    deliveries_data = fetch_deliveries(session, startTime=start_time)
+
+    for delivery in deliveries_data:
+        cur.execute(
+            f"""
+            INSERT INTO {user}_deliveries (timestamp, symbol, side, position, 
+                                          entry_price, delivery_price, strike, fee, delivery_rpl)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, timestamp) DO NOTHING
+            """,
+            (
+                delivery["timestamp"],
+                delivery["symbol"],
+                delivery["side"],
+                delivery["position"],
+                delivery["entryPrice"],
+                delivery["deliveryPrice"],
+                delivery["strike"],
+                delivery["fee"],
+                delivery["deliveryRpl"],
+            ),
+        )
+
+    logging.info(
+        f"Updated deliveries data for {user}, inserted {len(deliveries_data)} records."
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 def run_scheduler(user, api_key, api_secret):
     """Main function to run the scheduler"""
     # Initialize database
     init_database(user)
-
+    session = HTTP(
+        testnet=False,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
     # Set up scheduler
     scheduler = BlockingScheduler()
-    scheduled_data_collection(user, api_key, api_secret)
+    scheduled_data_collection(user, session)
+    update_income(session, user)
+    update_trades(session, user)
+    update_deliveries(session, user)
     # Schedule the job to run every 5 minutes
     scheduler.add_job(
-        lambda: scheduled_data_collection(user, api_key, api_secret),
+        lambda: scheduled_data_collection(user, session),
         "interval",
         minutes=5,
         id="data_collection_job",
+    )
+    scheduler.add_job(
+        lambda: update_income(session, user),
+        "interval",
+        minutes=60,
+        id="income_update_job",
+    )
+    scheduler.add_job(
+        lambda: update_trades(session, user),
+        "interval",
+        minutes=60,
+        id="trades_update_job",
+    )
+    scheduler.add_job(
+        lambda: update_deliveries(session, user),
+        "interval",
+        minutes=60,
+        id="deliveries_update_job",
     )
 
     logging.info("Starting scheduler - data collection will run every 5 minutes")
