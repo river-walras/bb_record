@@ -337,16 +337,16 @@ def get_open_orders(session: HTTP, user: str, category: str):
                     updated_at = CURRENT_TIMESTAMP
             """,
                 (
-                    order["order_id"],
-                    order["symbol"],
-                    order["side"],
-                    order["qty"],
-                    order["leaves_qty"],
-                    order["status"],
-                    order["price"],
-                    order["avg_price"],
-                    order["order_type"],
-                    order["category"],
+                    str(order["order_id"]),
+                    str(order["symbol"]),
+                    str(order["side"]),
+                    float(order["qty"]),
+                    float(order["leaves_qty"]),
+                    str(order["status"]),
+                    float(order["price"]) if order["price"] else 0.0,
+                    float(order["avg_price"]) if order["avg_price"] else 0.0,
+                    str(order["order_type"]),
+                    str(order["category"]),
                 ),
             )
 
@@ -598,7 +598,7 @@ def get_trade_history(
             "execPrice": float(item["execPrice"]) if item["execPrice"] else 0.0,
             "orderPrice": float(item["orderPrice"]) if item["orderPrice"] else 0.0,
             "execQty": float(item["execQty"]) if item["execQty"] else 0.0,
-            "fee": float(item["fee"]) if item["fee"] else 0.0,
+            "fee": float(item["execFee"]) if item["execFee"] else 0.0,
         }
         for item in data
     ]
@@ -918,7 +918,7 @@ def run_scheduler(user, api_key, api_secret):
     scheduler.add_job(
         lambda: scheduled_data_collection(user, session),
         "interval",
-        minutes=5,
+        minutes=2,
         id="data_collection_job",
     )
     scheduler.add_job(
