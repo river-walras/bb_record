@@ -49,7 +49,9 @@ def init_database(user: str):
             account_mm_rate DECIMAL(10, 8),
             total_maintenance_margin DECIMAL(20, 8),
             usdt_equity DECIMAL(20, 8),
+            usdt_balance DECIMAL(20, 8),
             btc_equity DECIMAL(20, 8),
+            btc_balance DECIMAL(20, 8),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -178,7 +180,9 @@ def get_wallet_balance(session: HTTP, user: str):
     coins_info = {item["coin"]: item for item in account_info.get("coin", [])}
 
     usdt_equity = float(coins_info.get("USDT", {}).get("equity", "0"))
+    usdt_balance = float(coins_info.get("USDT", {}).get("walletBalance", "0"))
     btc_equity = float(coins_info.get("BTC", {}).get("equity", "0"))
+    btc_balance = float(coins_info.get("BTC", {}).get("walletBalance", "0"))
 
     wallet_data = {
         "timestamp": ts,
@@ -201,8 +205,8 @@ def get_wallet_balance(session: HTTP, user: str):
         INSERT INTO {user}_wallet_balance (timestamp, total_equity, account_im_rate, 
                                   total_margin_balance, total_initial_margin, 
                                   total_available_balance, account_mm_rate, 
-                                  total_maintenance_margin, usdt_equity, btc_equity)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                  total_maintenance_margin, usdt_equity, btc_equity, usdt_balance, btc_balance)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """,
         (
             ts,
@@ -215,6 +219,8 @@ def get_wallet_balance(session: HTTP, user: str):
             totalMaintenanceMargin,
             usdt_equity,
             btc_equity,
+            usdt_balance,
+            btc_balance,
         ),
     )
     conn.commit()
